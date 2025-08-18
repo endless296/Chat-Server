@@ -1,18 +1,12 @@
 {
-  "name": "enhanced-websocket-server",
+  "name": "websocket-server",
   "version": "1.0.0",
-  "description": "A WebSocket server with presence, channels, and WebRTC signaling",
   "main": "server.js",
   "scripts": {
-    "start": "node server.s",
-    "build": "echo 'No build step needed'"
+    "start": "node server.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "MIT",
   "dependencies": {
-    "uuid": "^9.0.0",
-    "ws": "^8.13.0"
+    "ws": "^8.16.0",
+    "uuid": "^9.0.0"
   }
 }
-
