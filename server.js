@@ -640,23 +640,43 @@ wss.on('connection', (ws, req) => {
       }));
     }
   });
+  // REPLACE the ws.on('close') handler with this fixed version:
 
-  // Handle client disconnect
-  ws.on('close', (code, reason) => {
-    clearTimeout(connectionTimeout);
-    console.log(`🔌 Client ${ws.clientId} disconnected (${code}): ${reason || 'No reason'}`);
+ws.on('close', (code, reason) => {
+  clearTimeout(connectionTimeout);
+  console.log(`🔌 Client ${ws.clientId} disconnected (${code}): ${reason || 'No reason'}`);
+  
+  if (ws.clientId) {
+    // Get all presence channels the user was in BEFORE removing them
+    const userChannels = presenceManager.userPresence.get(ws.clientId);
     
-    if (ws.clientId) {
-      // Remove from presence channels
+    // Broadcast presence-leave to each channel
+    if (userChannels) {
+      userChannels.forEach(presenceChannel => {
+        // Remove user from presence
+        const remainingMembers = presenceManager.leave(presenceChannel, ws.clientId);
+        
+        // Broadcast to other clients in the channel
+        channelManager.broadcast(presenceChannel, {
+          type: 'presence-leave',
+          clientId: ws.clientId,
+          members: remainingMembers
+        });
+        
+        console.log(`👋 Broadcasted presence-leave for ${ws.clientId} in ${presenceChannel}`);
+      });
+    } else {
+      // Fallback: remove from all presence channels without broadcasting
       presenceManager.leaveAll(ws.clientId);
-      
-      // Unsubscribe from all channels
-      channelManager.unsubscribeFromAll(ws);
-      
-      // Remove client
-      clientManager.removeClient(ws.clientId);
     }
-  });
+    
+    // Unsubscribe from all channels
+    channelManager.unsubscribeFromAll(ws);
+    
+    // Remove client
+    clientManager.removeClient(ws.clientId);
+  }
+});
 
   // Handle errors
   ws.on('error', (error) => {
