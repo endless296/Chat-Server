@@ -1,12 +1,12 @@
 const WebSocket = require('ws');
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
 const { v4: uuidv4 } = require('uuid');
+
+// Push API URL for notifications
+const PUSH_API_URL = process.env.PUSH_API_URL || 'https://octopus-push-api-production-677b.up.railway.app';
 
 // Create HTTP server
 const server = http.createServer((req, res) => {
-  // Add CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -22,9 +22,9 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ 
       status: 'OK', 
       timestamp: new Date().toISOString(),
-      connections: clients.size,
-      channels: channels.size,
-      presenceChannels: presenceData.size
+      connections: clientManager.clients.size,
+      channels: channelManager.channels.size,
+      presenceChannels: presenceManager.presenceData.size
     }));
   } else {
     res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -32,17 +32,13 @@ const server = http.createServer((req, res) => {
   }
 });
 
-// Create WebSocket server with enhanced options
+// Create WebSocket server
 const wss = new WebSocket.Server({ 
   server,
-  perMessageDeflate: {
-    zlibDeflateOptions: {
-      level: 9,
-    }
-  }
+  perMessageDeflate: { zlibDeflateOptions: { level: 9 } }
 });
 
-// Enhanced client storage with metadata
+// Client Manager
 class ClientManager {
   constructor() {
     this.clients = new Map();
@@ -57,14 +53,14 @@ class ClientManager {
       lastActivity: new Date().toISOString()
     });
     ws.clientId = clientId;
-    console.log(`✅ Client ${clientId} connected. Total clients: ${this.clients.size}`);
+    console.log(`✅ Client ${clientId} connected. Total: ${this.clients.size}`);
   }
 
   removeClient(clientId) {
     if (this.clients.has(clientId)) {
       this.clients.delete(clientId);
       this.clientMetadata.delete(clientId);
-      console.log(`❌ Client ${clientId} disconnected. Total clients: ${this.clients.size}`);
+      console.log(`❌ Client ${clientId} disconnected. Total: ${this.clients.size}`);
     }
   }
 
@@ -74,29 +70,23 @@ class ClientManager {
 
   updateActivity(clientId) {
     const metadata = this.clientMetadata.get(clientId);
-    if (metadata) {
-      metadata.lastActivity = new Date().toISOString();
-    }
+    if (metadata) metadata.lastActivity = new Date().toISOString();
   }
 
   isClientConnected(clientId) {
     const client = this.clients.get(clientId);
     return client && client.readyState === WebSocket.OPEN;
   }
-
-  getConnectedClients() {
-    return Array.from(this.clients.keys()).filter(clientId => this.isClientConnected(clientId));
-  }
 }
 
-// Enhanced channel management
+// Channel Manager
 class ChannelManager {
   constructor() {
     this.channels = new Map();
     this.channelMetadata = new Map();
   }
 
-  subscribe(channelName, client, metadata = {}) {
+  subscribe(channelName, client) {
     if (!this.channels.has(channelName)) {
       this.channels.set(channelName, new Set());
       this.channelMetadata.set(channelName, {
@@ -104,7 +94,6 @@ class ChannelManager {
         messageCount: 0
       });
     }
-    
     this.channels.get(channelName).add(client);
     console.log(`📡 Client ${client.clientId} subscribed to ${channelName}`);
   }
@@ -116,7 +105,6 @@ class ChannelManager {
       if (channel.size === 0) {
         this.channels.delete(channelName);
         this.channelMetadata.delete(channelName);
-        console.log(`🗑️  Channel ${channelName} deleted (no subscribers)`);
       }
     }
   }
@@ -135,27 +123,18 @@ class ChannelManager {
     const channel = this.channels.get(channelName);
     if (channel) {
       const metadata = this.channelMetadata.get(channelName);
-      if (metadata) {
-        metadata.messageCount++;
-      }
+      if (metadata) metadata.messageCount++;
 
-      let sentCount = 0;
       channel.forEach(client => {
         if (client !== excludeClient && client.readyState === WebSocket.OPEN) {
           try {
             client.send(JSON.stringify(message));
-            sentCount++;
           } catch (error) {
-            console.error(`❌ Error sending to client ${client.clientId}:`, error.message);
-            // Remove dead connection
+            console.error(`❌ Error sending to ${client.clientId}:`, error.message);
             channel.delete(client);
           }
         }
       });
-      
-      if (sentCount > 0) {
-        console.log(`📤 Broadcasted to ${sentCount} clients in ${channelName}`);
-      }
     }
   }
 
@@ -170,42 +149,35 @@ class ChannelManager {
   }
 }
 
-// Enhanced presence management
+// Presence Manager
 class PresenceManager {
   constructor() {
     this.presenceData = new Map();
-    this.userPresence = new Map(); // Track which channels each user is in
+    this.userPresence = new Map();
   }
 
   enter(presenceChannel, clientId) {
-    // Add to presence channel
     if (!this.presenceData.has(presenceChannel)) {
       this.presenceData.set(presenceChannel, new Set());
     }
     this.presenceData.get(presenceChannel).add(clientId);
 
-    // Track user's presence channels
     if (!this.userPresence.has(clientId)) {
       this.userPresence.set(clientId, new Set());
     }
     this.userPresence.get(clientId).add(presenceChannel);
 
-    console.log(`👋 Client ${clientId} entered presence channel ${presenceChannel}`);
-    
     return Array.from(this.presenceData.get(presenceChannel));
   }
 
   leave(presenceChannel, clientId) {
     if (this.presenceData.has(presenceChannel)) {
       this.presenceData.get(presenceChannel).delete(clientId);
-      
-      // Clean up empty channels
       if (this.presenceData.get(presenceChannel).size === 0) {
         this.presenceData.delete(presenceChannel);
       }
     }
 
-    // Remove from user's presence tracking
     if (this.userPresence.has(clientId)) {
       this.userPresence.get(clientId).delete(presenceChannel);
       if (this.userPresence.get(clientId).size === 0) {
@@ -213,8 +185,6 @@ class PresenceManager {
       }
     }
 
-    console.log(`👋 Client ${clientId} left presence channel ${presenceChannel}`);
-    
     return this.presenceData.has(presenceChannel) ? 
            Array.from(this.presenceData.get(presenceChannel)) : [];
   }
@@ -222,20 +192,13 @@ class PresenceManager {
   leaveAll(clientId) {
     const userChannels = this.userPresence.get(clientId);
     if (userChannels) {
-      userChannels.forEach(channel => {
-        this.leave(channel, clientId);
-      });
+      userChannels.forEach(channel => this.leave(channel, clientId));
     }
   }
 
   getMembers(presenceChannel) {
     return this.presenceData.has(presenceChannel) ? 
            Array.from(this.presenceData.get(presenceChannel)) : [];
-  }
-
-  isUserOnline(userId, presenceChannel) {
-    return this.presenceData.has(presenceChannel) && 
-           this.presenceData.get(presenceChannel).has(userId);
   }
 }
 
@@ -244,48 +207,31 @@ const clientManager = new ClientManager();
 const channelManager = new ChannelManager();
 const presenceManager = new PresenceManager();
 
-// Legacy references for backward compatibility
-const clients = clientManager.clients;
-const channels = channelManager.channels;
-const presenceData = presenceManager.presenceData;
-
-// Helper functions
-function sendToClient(clientId, message) {
-  const client = clientManager.getClient(clientId);
-  if (client && client.readyState === WebSocket.OPEN) {
-    try {
-      client.send(JSON.stringify(message));
-      return true;
-    } catch (error) {
-      console.error(`❌ Error sending to client ${clientId}:`, error.message);
-      return false;
+// Helper: Send call notification via Push API
+async function sendCallNotification(callerId, receiverId, callType) {
+  try {
+    const response = await fetch(`${PUSH_API_URL}/api/push/call`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        caller_id: callerId,
+        receiver_id: receiverId,
+        call_type: callType
+      })
+    });
+    
+    if (response.ok) {
+      console.log(`📱 Call notification sent: ${callerId} → ${receiverId} (${callType})`);
     }
+  } catch (error) {
+    console.error('❌ Failed to send call notification:', error.message);
   }
-  return false;
-}
-
-function generateChannelName(type, userId1, userId2) {
-  const sortedIds = [userId1, userId2].sort();
-  return `${type}-${sortedIds[0]}-${sortedIds[1]}`;
-}
-
-function validateMessage(message) {
-  if (!message || typeof message !== 'object') {
-    return { valid: false, error: 'Invalid message format' };
-  }
-
-  const { type, clientId } = message;
-  if (!type || !clientId) {
-    return { valid: false, error: 'Missing required fields: type, clientId' };
-  }
-
-  return { valid: true };
 }
 
 // Rate limiting
 const rateLimiter = new Map();
-const RATE_LIMIT_WINDOW = 60000; // 1 minute
-const RATE_LIMIT_MAX_REQUESTS = 100; // Max requests per window
+const RATE_LIMIT_WINDOW = 60000;
+const RATE_LIMIT_MAX_REQUESTS = 100;
 
 function checkRateLimit(clientId) {
   const now = Date.now();
@@ -304,67 +250,49 @@ function checkRateLimit(clientId) {
 
 // WebSocket connection handling
 wss.on('connection', (ws, req) => {
-  console.log('🔗 New WebSocket connection from', req.socket.remoteAddress);
+  console.log('🔗 New connection from', req.socket.remoteAddress);
   
-  // Connection timeout
   const connectionTimeout = setTimeout(() => {
     if (!ws.clientId) {
-      console.log('⏰ Closing connection due to no client identification');
-      ws.close(1000, 'No client identification received');
+      ws.close(1000, 'No client identification');
     }
-  }, 30000); // 30 seconds to identify
+  }, 30000);
 
   ws.on('message', (data) => {
     try {
       const message = JSON.parse(data.toString());
-      const validation = validateMessage(message);
-      
-      if (!validation.valid) {
-        ws.send(JSON.stringify({
-          type: 'error',
-          error: validation.error
-        }));
-        return;
-      }
-
       const { type, clientId, channel, payload } = message;
 
-      // Rate limiting
-      if (!checkRateLimit(clientId)) {
-        ws.send(JSON.stringify({
-          type: 'error',
-          error: 'Rate limit exceeded'
-        }));
+      if (!type || !clientId) {
+        ws.send(JSON.stringify({ type: 'error', error: 'Missing type or clientId' }));
         return;
       }
 
-      // Clear connection timeout on first valid message
+      if (!checkRateLimit(clientId)) {
+        ws.send(JSON.stringify({ type: 'error', error: 'Rate limit exceeded' }));
+        return;
+      }
+
       if (!ws.clientId) {
         clearTimeout(connectionTimeout);
         clientManager.addClient(clientId, ws, { ip: req.socket.remoteAddress });
       }
 
-      // Update client activity
       clientManager.updateActivity(clientId);
 
-      // Handle different message types
       switch (type) {
         case 'subscribe':
           if (!channel) {
-            ws.send(JSON.stringify({ type: 'error', error: 'Channel name required' }));
+            ws.send(JSON.stringify({ type: 'error', error: 'Channel required' }));
             return;
           }
           channelManager.subscribe(channel, ws);
-          ws.send(JSON.stringify({ 
-            type: 'subscribed', 
-            channel,
-            info: channelManager.getChannelInfo(channel)
-          }));
+          ws.send(JSON.stringify({ type: 'subscribed', channel }));
           break;
 
         case 'unsubscribe':
           if (!channel) {
-            ws.send(JSON.stringify({ type: 'error', error: 'Channel name required' }));
+            ws.send(JSON.stringify({ type: 'error', error: 'Channel required' }));
             return;
           }
           channelManager.unsubscribe(channel, ws);
@@ -379,15 +307,12 @@ wss.on('connection', (ws, req) => {
           }
           
           const members = presenceManager.enter(presenceChannel, clientId);
-          
-          // Notify other clients in presence channel
           channelManager.broadcast(presenceChannel, {
             type: 'presence-enter',
             clientId: clientId,
             members: members
           }, ws);
           
-          // Send current members to joining client
           ws.send(JSON.stringify({
             type: 'presence-members',
             channel: presenceChannel,
@@ -403,8 +328,6 @@ wss.on('connection', (ws, req) => {
           }
           
           const remainingMembers = presenceManager.leave(leaveChannel, clientId);
-          
-          // Notify other clients in presence channel
           channelManager.broadcast(leaveChannel, {
             type: 'presence-leave',
             clientId: clientId,
@@ -412,341 +335,215 @@ wss.on('connection', (ws, req) => {
           });
           break;
 
-        case 'presence-get':
-          const getChannel = payload?.presenceChannel;
-          if (!getChannel) {
-            ws.send(JSON.stringify({ type: 'error', error: 'Presence channel required' }));
-            return;
-          }
-          
-          ws.send(JSON.stringify({
-            type: 'presence-members',
-            channel: getChannel,
-            members: presenceManager.getMembers(getChannel)
-          }));
-          break;
-
         case 'message':
           if (!payload?.senderId || !payload?.receiverId) {
-            ws.send(JSON.stringify({ type: 'error', error: 'Sender and receiver IDs required' }));
+            ws.send(JSON.stringify({ type: 'error', error: 'Sender and receiver required' }));
             return;
           }
           
           const messageData = {
             ...payload,
             id: payload.id || uuidv4(),
-            timestamp: payload.timestamp || new Date().toISOString(),
-            serverProcessed: new Date().toISOString()
+            timestamp: payload.timestamp || new Date().toISOString()
           };
           
-          const messagePayload = {
-            type: 'newMessage',
-            data: messageData
-          };
-          
-          // Broadcast to both channel directions
           const channelA = `chat-${payload.senderId}-${payload.receiverId}`;
           const channelB = `chat-${payload.receiverId}-${payload.senderId}`;
           
-          channelManager.broadcast(channelA, messagePayload);
-          channelManager.broadcast(channelB, messagePayload);
-          
-          console.log(`💬 Message from ${payload.senderId} to ${payload.receiverId}`);
+          channelManager.broadcast(channelA, { type: 'newMessage', data: messageData });
+          channelManager.broadcast(channelB, { type: 'newMessage', data: messageData });
           break;
 
         case 'typing':
           if (!payload?.senderId || !payload?.receiverId) {
-            ws.send(JSON.stringify({ type: 'error', error: 'Sender and receiver IDs required' }));
+            ws.send(JSON.stringify({ type: 'error', error: 'Sender and receiver required' }));
             return;
           }
-          
-          const typingPayload = {
-            type: 'typing',
-            data: {
-              ...payload,
-              timestamp: new Date().toISOString()
-            }
-          };
           
           const typingChannelA = `chat-${payload.senderId}-${payload.receiverId}`;
           const typingChannelB = `chat-${payload.receiverId}-${payload.senderId}`;
           
-          channelManager.broadcast(typingChannelA, typingPayload, ws);
-          channelManager.broadcast(typingChannelB, typingPayload, ws);
+          channelManager.broadcast(typingChannelA, { type: 'typing', data: payload }, ws);
+          channelManager.broadcast(typingChannelB, { type: 'typing', data: payload }, ws);
           break;
 
         case 'message-seen':
           if (!payload?.messageId || !payload?.senderId || !payload?.receiverId) {
-            ws.send(JSON.stringify({ type: 'error', error: 'Message ID, sender and receiver IDs required' }));
+            ws.send(JSON.stringify({ type: 'error', error: 'Message ID, sender and receiver required' }));
             return;
           }
-          
-          const seenPayload = {
-            type: 'messageSeenAcknowledgment',
-            data: { 
-              id: payload.messageId,
-              seenBy: payload.senderId,
-              seenAt: new Date().toISOString()
-            }
-          };
           
           const seenChannelA = `chat-${payload.senderId}-${payload.receiverId}`;
           const seenChannelB = `chat-${payload.receiverId}-${payload.senderId}`;
           
-          channelManager.broadcast(seenChannelA, seenPayload);
-          channelManager.broadcast(seenChannelB, seenPayload);
+          channelManager.broadcast(seenChannelA, {
+            type: 'messageSeenAcknowledgment',
+            data: { id: payload.messageId, seenBy: payload.senderId, seenAt: new Date().toISOString() }
+          });
+          channelManager.broadcast(seenChannelB, {
+            type: 'messageSeenAcknowledgment',
+            data: { id: payload.messageId, seenBy: payload.senderId, seenAt: new Date().toISOString() }
+          });
           break;
 
-        // WebRTC signaling with enhanced error handling
+        // WebRTC with call notifications
         case 'rtc-offer':
-          if (!payload?.from || !payload?.to || !payload?.offer) {
-            ws.send(JSON.stringify({ type: 'error', error: 'Invalid RTC offer data' }));
+          if (!payload?.from || !payload?.to || !payload?.offer || !payload?.callType) {
+            ws.send(JSON.stringify({ type: 'error', error: 'Invalid RTC offer' }));
             return;
           }
           
-          const offerChannel = `rtc-${payload.to}-${payload.from}`;
-          const offerMessage = {
-            type: 'offer',
-            data: {
-              ...payload.offer,
-              from: payload.from,
-              timestamp: new Date().toISOString()
-            }
-          };
+          // Send push notification for incoming call
+          sendCallNotification(payload.from, payload.to, payload.callType);
           
-          channelManager.broadcast(offerChannel, offerMessage);
-          console.log(`📞 RTC offer from ${payload.from} to ${payload.to}`);
+          const offerChannel = `rtc-${payload.to}-${payload.from}`;
+          channelManager.broadcast(offerChannel, {
+            type: 'offer',
+            data: { ...payload.offer, from: payload.from, callType: payload.callType }
+          });
+          console.log(`📞 ${payload.callType} call: ${payload.from} → ${payload.to}`);
           break;
 
         case 'rtc-answer':
           if (!payload?.from || !payload?.to || !payload?.answer) {
-            ws.send(JSON.stringify({ type: 'error', error: 'Invalid RTC answer data' }));
+            ws.send(JSON.stringify({ type: 'error', error: 'Invalid RTC answer' }));
             return;
           }
           
           const answerChannel = `rtc-${payload.from}-${payload.to}`;
           channelManager.broadcast(answerChannel, {
             type: 'answer',
-            data: {
-              ...payload.answer,
-              from: payload.from,
-              timestamp: new Date().toISOString()
-            }
+            data: { ...payload.answer, from: payload.from }
           });
-          console.log(`📞 RTC answer from ${payload.from} to ${payload.to}`);
+          console.log(`📞 Call answered: ${payload.from} → ${payload.to}`);
           break;
 
         case 'rtc-ice-candidate':
           if (!payload?.from || !payload?.to || !payload?.candidate) {
-            ws.send(JSON.stringify({ type: 'error', error: 'Invalid ICE candidate data' }));
+            ws.send(JSON.stringify({ type: 'error', error: 'Invalid ICE candidate' }));
             return;
           }
           
           const iceChannelA = `rtc-${payload.from}-${payload.to}`;
           const iceChannelB = `rtc-${payload.to}-${payload.from}`;
           
-          const iceMessage = {
-            type: 'ice-candidate',
-            data: {
-              ...payload.candidate,
-              from: payload.from,
-              timestamp: new Date().toISOString()
-            }
-          };
-          
+          const iceMessage = { type: 'ice-candidate', data: { ...payload.candidate, from: payload.from } };
           channelManager.broadcast(iceChannelA, iceMessage);
           channelManager.broadcast(iceChannelB, iceMessage);
-          console.log(`🧊 ICE candidate from ${payload.from} to ${payload.to}`);
           break;
 
         case 'rtc-call-ended':
           if (!payload?.from || !payload?.to) {
-            ws.send(JSON.stringify({ type: 'error', error: 'Invalid call end data' }));
+            ws.send(JSON.stringify({ type: 'error', error: 'Invalid call end' }));
             return;
           }
           
           const endChannelA = `rtc-${payload.from}-${payload.to}`;
           const endChannelB = `rtc-${payload.to}-${payload.from}`;
           
-          const endMessage = {
-            type: 'call-ended',
-            data: { 
-              from: payload.from,
-              reason: payload.reason || 'ended',
-              timestamp: new Date().toISOString()
-            }
-          };
-          
+          const endMessage = { type: 'call-ended', data: { from: payload.from, reason: payload.reason || 'ended' } };
           channelManager.broadcast(endChannelA, endMessage);
           channelManager.broadcast(endChannelB, endMessage);
-          console.log(`📞❌ Call ended by ${payload.from}`);
+          console.log(`📞 Call ended: ${payload.from}`);
           break;
 
         case 'rtc-call-rejected':
           if (!payload?.from || !payload?.to) {
-            ws.send(JSON.stringify({ type: 'error', error: 'Invalid call rejection data' }));
+            ws.send(JSON.stringify({ type: 'error', error: 'Invalid rejection' }));
             return;
           }
           
           const rejectChannelA = `rtc-${payload.from}-${payload.to}`;
           const rejectChannelB = `rtc-${payload.to}-${payload.from}`;
           
-          const rejectMessage = {
-            type: 'call-rejected',
-            data: { 
-              from: payload.from,
-              timestamp: new Date().toISOString()
-            }
-          };
-          
+          const rejectMessage = { type: 'call-rejected', data: { from: payload.from } };
           channelManager.broadcast(rejectChannelA, rejectMessage);
           channelManager.broadcast(rejectChannelB, rejectMessage);
-          console.log(`📞❌ Call rejected by ${payload.from}`);
+          console.log(`📞 Call rejected: ${payload.from}`);
           break;
 
         case 'ping':
-          ws.send(JSON.stringify({ 
-            type: 'pong', 
-            timestamp: new Date().toISOString() 
-          }));
-          break;
-
-        case 'get-status':
-          ws.send(JSON.stringify({
-            type: 'status',
-            data: {
-              clientId: clientId,
-              connected: true,
-              serverTime: new Date().toISOString(),
-              totalClients: clientManager.clients.size,
-              totalChannels: channelManager.channels.size
-            }
-          }));
+          ws.send(JSON.stringify({ type: 'pong', timestamp: new Date().toISOString() }));
           break;
 
         default:
-          ws.send(JSON.stringify({ 
-            type: 'error', 
-            error: `Unknown message type: ${type}` 
-          }));
-          console.log('❓ Unknown message type:', type);
+          ws.send(JSON.stringify({ type: 'error', error: `Unknown type: ${type}` }));
           break;
       }
     } catch (error) {
       console.error('❌ Error processing message:', error);
-      ws.send(JSON.stringify({
-        type: 'error',
-        error: 'Invalid message format or server error'
-      }));
+      ws.send(JSON.stringify({ type: 'error', error: 'Invalid message' }));
     }
   });
-  // REPLACE the ws.on('close') handler with this fixed version:
 
-ws.on('close', (code, reason) => {
-  clearTimeout(connectionTimeout);
-  console.log(`🔌 Client ${ws.clientId} disconnected (${code}): ${reason || 'No reason'}`);
-  
-  if (ws.clientId) {
-    // Get all presence channels the user was in BEFORE removing them
-    const userChannels = presenceManager.userPresence.get(ws.clientId);
+  ws.on('close', (code, reason) => {
+    clearTimeout(connectionTimeout);
     
-    // Broadcast presence-leave to each channel
-    if (userChannels) {
-      userChannels.forEach(presenceChannel => {
-        // Remove user from presence
-        const remainingMembers = presenceManager.leave(presenceChannel, ws.clientId);
-        
-        // Broadcast to other clients in the channel
-        channelManager.broadcast(presenceChannel, {
-          type: 'presence-leave',
-          clientId: ws.clientId,
-          members: remainingMembers
+    if (ws.clientId) {
+      const userChannels = presenceManager.userPresence.get(ws.clientId);
+      
+      if (userChannels) {
+        userChannels.forEach(presenceChannel => {
+          const remainingMembers = presenceManager.leave(presenceChannel, ws.clientId);
+          channelManager.broadcast(presenceChannel, {
+            type: 'presence-leave',
+            clientId: ws.clientId,
+            members: remainingMembers
+          });
         });
-        
-        console.log(`👋 Broadcasted presence-leave for ${ws.clientId} in ${presenceChannel}`);
-      });
-    } else {
-      // Fallback: remove from all presence channels without broadcasting
-      presenceManager.leaveAll(ws.clientId);
+      } else {
+        presenceManager.leaveAll(ws.clientId);
+      }
+      
+      channelManager.unsubscribeFromAll(ws);
+      clientManager.removeClient(ws.clientId);
     }
-    
-    // Unsubscribe from all channels
-    channelManager.unsubscribeFromAll(ws);
-    
-    // Remove client
-    clientManager.removeClient(ws.clientId);
-  }
-});
-
-  // Handle errors
-  ws.on('error', (error) => {
-    console.error(`❌ WebSocket error for client ${ws.clientId || 'unknown'}:`, error.message);
   });
 
-  // Send welcome message
+  ws.on('error', (error) => {
+    console.error(`❌ WebSocket error for ${ws.clientId || 'unknown'}:`, error.message);
+  });
+
   ws.send(JSON.stringify({
     type: 'connection',
-    message: 'Connected to enhanced chat server',
-    timestamp: new Date().toISOString(),
-    serverVersion: '2.0.0'
+    message: 'Connected to chat server',
+    timestamp: new Date().toISOString()
   }));
 });
 
-// Periodic cleanup for dead connections and rate limiting
+// Cleanup dead connections
 setInterval(() => {
   const now = Date.now();
   
-  // Clean up rate limiter
   rateLimiter.forEach((data, clientId) => {
     if (now - data.windowStart > RATE_LIMIT_WINDOW * 2) {
       rateLimiter.delete(clientId);
     }
   });
   
-  // Clean up dead WebSocket connections
   clientManager.clients.forEach((client, clientId) => {
     if (client.readyState === WebSocket.CLOSED) {
-      console.log(`🧹 Cleaning up dead connection: ${clientId}`);
       presenceManager.leaveAll(clientId);
       channelManager.unsubscribeFromAll(client);
       clientManager.removeClient(clientId);
     }
   });
-  
-}, 300000); // Every 5 minutes
+}, 300000);
 
 // Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('🛑 Received SIGTERM, shutting down gracefully...');
+const shutdown = () => {
   wss.clients.forEach(client => {
-    client.send(JSON.stringify({
-      type: 'server-shutdown',
-      message: 'Server is shutting down'
-    }));
+    client.send(JSON.stringify({ type: 'server-shutdown' }));
     client.close(1000, 'Server shutdown');
   });
-  server.close(() => {
-    process.exit(0);
-  });
-});
+  server.close(() => process.exit(0));
+};
 
-process.on('SIGINT', () => {
-  console.log('🛑 Received SIGINT, shutting down gracefully...');
-  wss.clients.forEach(client => {
-    client.send(JSON.stringify({
-      type: 'server-shutdown',
-      message: 'Server is shutting down'
-    }));
-    client.close(1000, 'Server shutdown');
-  });
-  server.close(() => {
-    process.exit(0);
-  });
-});
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚀 Enhanced WebSocket server running on port ${PORT}`);
-  console.log(`📡 WebSocket endpoint: ws://localhost:${PORT}`);
-  console.log(`🌐 Health check: http://localhost:${PORT}/health`);
+  console.log(`🚀 WebSocket server running on port ${PORT}`);
+  console.log(`📡 Push API: ${PUSH_API_URL}`);
 });
