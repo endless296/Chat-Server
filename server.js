@@ -5,6 +5,12 @@ const { v4: uuidv4 } = require('uuid');
 // Push API URL for notifications
 const PUSH_API_URL = process.env.PUSH_API_URL || 'https://octopus-push-api-production-677b.up.railway.app';
 
+// Helper function to create unified channel (MUST match client!)
+function createUnifiedChannel(type, userId1, userId2) {
+  const sortedIds = [userId1, userId2].sort();
+  return `${type}-${sortedIds.join('-')}`;
+}
+
 // Create HTTP server
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -125,16 +131,22 @@ class ChannelManager {
       const metadata = this.channelMetadata.get(channelName);
       if (metadata) metadata.messageCount++;
 
+      let sentCount = 0;
       channel.forEach(client => {
         if (client !== excludeClient && client.readyState === WebSocket.OPEN) {
           try {
             client.send(JSON.stringify(message));
+            sentCount++;
           } catch (error) {
             console.error(`❌ Error sending to ${client.clientId}:`, error.message);
             channel.delete(client);
           }
         }
       });
+      
+      console.log(`📤 Broadcast to ${channelName}: ${sentCount} recipients`);
+    } else {
+      console.warn(`⚠️ Channel ${channelName} not found for broadcast`);
     }
   }
 
@@ -287,7 +299,12 @@ wss.on('connection', (ws, req) => {
             return;
           }
           channelManager.subscribe(channel, ws);
-          ws.send(JSON.stringify({ type: 'subscribed', channel }));
+          // FIX: Send channel in payload to match client expectations
+          ws.send(JSON.stringify({ 
+            type: 'subscribed', 
+            payload: { channel },
+            channel  // Also keep at root for compatibility
+          }));
           break;
 
         case 'unsubscribe':
@@ -335,6 +352,21 @@ wss.on('connection', (ws, req) => {
           });
           break;
 
+        case 'presence-get-members':
+          const getMembersChannel = payload?.presenceChannel;
+          if (!getMembersChannel) {
+            ws.send(JSON.stringify({ type: 'error', error: 'Presence channel required' }));
+            return;
+          }
+          
+          const currentMembers = presenceManager.getMembers(getMembersChannel);
+          ws.send(JSON.stringify({
+            type: 'presence-members',
+            channel: getMembersChannel,
+            members: currentMembers
+          }));
+          break;
+
         case 'message':
           if (!payload?.senderId || !payload?.receiverId) {
             ws.send(JSON.stringify({ type: 'error', error: 'Sender and receiver required' }));
@@ -347,11 +379,9 @@ wss.on('connection', (ws, req) => {
             timestamp: payload.timestamp || new Date().toISOString()
           };
           
-          const channelA = `chat-${payload.senderId}-${payload.receiverId}`;
-          const channelB = `chat-${payload.receiverId}-${payload.senderId}`;
-          
-          channelManager.broadcast(channelA, { type: 'newMessage', data: messageData });
-          channelManager.broadcast(channelB, { type: 'newMessage', data: messageData });
+          // FIX: Use unified channel creation
+          const chatChannel = createUnifiedChannel('chat', payload.senderId, payload.receiverId);
+          channelManager.broadcast(chatChannel, { type: 'newMessage', data: messageData });
           break;
 
         case 'typing':
@@ -360,11 +390,9 @@ wss.on('connection', (ws, req) => {
             return;
           }
           
-          const typingChannelA = `chat-${payload.senderId}-${payload.receiverId}`;
-          const typingChannelB = `chat-${payload.receiverId}-${payload.senderId}`;
-          
-          channelManager.broadcast(typingChannelA, { type: 'typing', data: payload }, ws);
-          channelManager.broadcast(typingChannelB, { type: 'typing', data: payload }, ws);
+          // FIX: Use unified channel creation
+          const typingChannel = createUnifiedChannel('chat', payload.senderId, payload.receiverId);
+          channelManager.broadcast(typingChannel, { type: 'typing', data: payload }, ws);
           break;
 
         case 'message-seen':
@@ -373,31 +401,28 @@ wss.on('connection', (ws, req) => {
             return;
           }
           
-          const seenChannelA = `chat-${payload.senderId}-${payload.receiverId}`;
-          const seenChannelB = `chat-${payload.receiverId}-${payload.senderId}`;
-          
-          channelManager.broadcast(seenChannelA, {
-            type: 'messageSeenAcknowledgment',
-            data: { id: payload.messageId, seenBy: payload.senderId, seenAt: new Date().toISOString() }
-          });
-          channelManager.broadcast(seenChannelB, {
+          // FIX: Use unified channel creation
+          const seenChannel = createUnifiedChannel('chat', payload.senderId, payload.receiverId);
+          channelManager.broadcast(seenChannel, {
             type: 'messageSeenAcknowledgment',
             data: { id: payload.messageId, seenBy: payload.senderId, seenAt: new Date().toISOString() }
           });
           break;
 
-        // WebRTC with call notifications
+        // WebRTC with call notifications - USE CLIENT'S CHANNEL!
         case 'rtc-offer':
-          if (!payload?.from || !payload?.to || !payload?.offer || !payload?.callType) {
+          if (!channel || !payload?.from || !payload?.to || !payload?.offer || !payload?.callType) {
             ws.send(JSON.stringify({ type: 'error', error: 'Invalid RTC offer' }));
             return;
           }
           
+          console.log(`📞 Offer on channel: ${channel}`);
+          
           // Send push notification for incoming call
           sendCallNotification(payload.from, payload.to, payload.callType);
           
-          const offerChannel = `rtc-${payload.to}-${payload.from}`;
-          channelManager.broadcast(offerChannel, {
+          // FIX: Use the channel provided by client
+          channelManager.broadcast(channel, {
             type: 'offer',
             data: { ...payload.offer, from: payload.from, callType: payload.callType }
           });
@@ -405,13 +430,15 @@ wss.on('connection', (ws, req) => {
           break;
 
         case 'rtc-answer':
-          if (!payload?.from || !payload?.to || !payload?.answer) {
+          if (!channel || !payload?.from || !payload?.to || !payload?.answer) {
             ws.send(JSON.stringify({ type: 'error', error: 'Invalid RTC answer' }));
             return;
           }
           
-          const answerChannel = `rtc-${payload.from}-${payload.to}`;
-          channelManager.broadcast(answerChannel, {
+          console.log(`📞 Answer on channel: ${channel}`);
+          
+          // FIX: Use the channel provided by client
+          channelManager.broadcast(channel, {
             type: 'answer',
             data: { ...payload.answer, from: payload.from }
           });
@@ -419,46 +446,37 @@ wss.on('connection', (ws, req) => {
           break;
 
         case 'rtc-ice-candidate':
-          if (!payload?.from || !payload?.to || !payload?.candidate) {
+          if (!channel || !payload?.from || !payload?.to || !payload?.candidate) {
             ws.send(JSON.stringify({ type: 'error', error: 'Invalid ICE candidate' }));
             return;
           }
           
-          const iceChannelA = `rtc-${payload.from}-${payload.to}`;
-          const iceChannelB = `rtc-${payload.to}-${payload.from}`;
-          
+          // FIX: Use the channel provided by client
           const iceMessage = { type: 'ice-candidate', data: { ...payload.candidate, from: payload.from } };
-          channelManager.broadcast(iceChannelA, iceMessage);
-          channelManager.broadcast(iceChannelB, iceMessage);
+          channelManager.broadcast(channel, iceMessage);
           break;
 
         case 'rtc-call-ended':
-          if (!payload?.from || !payload?.to) {
+          if (!channel || !payload?.from || !payload?.to) {
             ws.send(JSON.stringify({ type: 'error', error: 'Invalid call end' }));
             return;
           }
           
-          const endChannelA = `rtc-${payload.from}-${payload.to}`;
-          const endChannelB = `rtc-${payload.to}-${payload.from}`;
-          
+          // FIX: Use the channel provided by client
           const endMessage = { type: 'call-ended', data: { from: payload.from, reason: payload.reason || 'ended' } };
-          channelManager.broadcast(endChannelA, endMessage);
-          channelManager.broadcast(endChannelB, endMessage);
+          channelManager.broadcast(channel, endMessage);
           console.log(`📞 Call ended: ${payload.from}`);
           break;
 
         case 'rtc-call-rejected':
-          if (!payload?.from || !payload?.to) {
+          if (!channel || !payload?.from || !payload?.to) {
             ws.send(JSON.stringify({ type: 'error', error: 'Invalid rejection' }));
             return;
           }
           
-          const rejectChannelA = `rtc-${payload.from}-${payload.to}`;
-          const rejectChannelB = `rtc-${payload.to}-${payload.from}`;
-          
+          // FIX: Use the channel provided by client
           const rejectMessage = { type: 'call-rejected', data: { from: payload.from } };
-          channelManager.broadcast(rejectChannelA, rejectMessage);
-          channelManager.broadcast(rejectChannelB, rejectMessage);
+          channelManager.broadcast(channel, rejectMessage);
           console.log(`📞 Call rejected: ${payload.from}`);
           break;
 
