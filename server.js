@@ -2,16 +2,18 @@ const WebSocket = require('ws');
 const http = require('http');
 const { v4: uuidv4 } = require('uuid');
 
-// Push API URL for notifications
 const PUSH_API_URL = process.env.PUSH_API_URL || 'https://octopus-push-api-production-677b.up.railway.app';
+const PORT = process.env.PORT || 3000;
+const RATE_LIMIT_WINDOW = 60000;
+const RATE_LIMIT_MAX_REQUESTS = 100;
+const CONNECTION_TIMEOUT = 30000;
+const CLEANUP_INTERVAL = 300000;
 
-// Helper function to create unified channel (MUST match client!)
 function createUnifiedChannel(type, userId1, userId2) {
   const sortedIds = [userId1, userId2].sort();
   return `${type}-${sortedIds.join('-')}`;
 }
 
-// Create HTTP server
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -38,13 +40,11 @@ const server = http.createServer((req, res) => {
   }
 });
 
-// Create WebSocket server
 const wss = new WebSocket.Server({ 
   server,
   perMessageDeflate: { zlibDeflateOptions: { level: 9 } }
 });
 
-// Client Manager
 class ClientManager {
   constructor() {
     this.clients = new Map();
@@ -59,14 +59,12 @@ class ClientManager {
       lastActivity: new Date().toISOString()
     });
     ws.clientId = clientId;
-    console.log(`✅ Client ${clientId} connected. Total: ${this.clients.size}`);
   }
 
   removeClient(clientId) {
     if (this.clients.has(clientId)) {
       this.clients.delete(clientId);
       this.clientMetadata.delete(clientId);
-      console.log(`❌ Client ${clientId} disconnected. Total: ${this.clients.size}`);
     }
   }
 
@@ -85,7 +83,6 @@ class ClientManager {
   }
 }
 
-// Channel Manager
 class ChannelManager {
   constructor() {
     this.channels = new Map();
@@ -101,7 +98,6 @@ class ChannelManager {
       });
     }
     this.channels.get(channelName).add(client);
-    console.log(`📡 Client ${client.clientId} subscribed to ${channelName}`);
   }
 
   unsubscribe(channelName, client) {
@@ -131,22 +127,15 @@ class ChannelManager {
       const metadata = this.channelMetadata.get(channelName);
       if (metadata) metadata.messageCount++;
 
-      let sentCount = 0;
       channel.forEach(client => {
         if (client !== excludeClient && client.readyState === WebSocket.OPEN) {
           try {
             client.send(JSON.stringify(message));
-            sentCount++;
           } catch (error) {
-            console.error(`❌ Error sending to ${client.clientId}:`, error.message);
             channel.delete(client);
           }
         }
       });
-      
-      console.log(`📤 Broadcast to ${channelName}: ${sentCount} recipients`);
-    } else {
-      console.warn(`⚠️ Channel ${channelName} not found for broadcast`);
     }
   }
 
@@ -161,7 +150,6 @@ class ChannelManager {
   }
 }
 
-// Presence Manager
 class PresenceManager {
   constructor() {
     this.presenceData = new Map();
@@ -214,12 +202,11 @@ class PresenceManager {
   }
 }
 
-// Initialize managers
 const clientManager = new ClientManager();
 const channelManager = new ChannelManager();
 const presenceManager = new PresenceManager();
+const rateLimiter = new Map();
 
-// Helper: Send call notification via Push API
 async function sendCallNotification(callerId, receiverId, callType) {
   try {
     const response = await fetch(`${PUSH_API_URL}/api/push/call`, {
@@ -231,19 +218,10 @@ async function sendCallNotification(callerId, receiverId, callType) {
         call_type: callType
       })
     });
-    
-    if (response.ok) {
-      console.log(`📱 Call notification sent: ${callerId} → ${receiverId} (${callType})`);
-    }
   } catch (error) {
-    console.error('❌ Failed to send call notification:', error.message);
+    // Silent fail
   }
 }
-
-// Rate limiting
-const rateLimiter = new Map();
-const RATE_LIMIT_WINDOW = 60000;
-const RATE_LIMIT_MAX_REQUESTS = 100;
 
 function checkRateLimit(clientId) {
   const now = Date.now();
@@ -260,15 +238,12 @@ function checkRateLimit(clientId) {
   return clientLimiter.count <= RATE_LIMIT_MAX_REQUESTS;
 }
 
-// WebSocket connection handling
 wss.on('connection', (ws, req) => {
-  console.log('🔗 New connection from', req.socket.remoteAddress);
-  
   const connectionTimeout = setTimeout(() => {
     if (!ws.clientId) {
       ws.close(1000, 'No client identification');
     }
-  }, 30000);
+  }, CONNECTION_TIMEOUT);
 
   ws.on('message', (data) => {
     try {
@@ -299,11 +274,10 @@ wss.on('connection', (ws, req) => {
             return;
           }
           channelManager.subscribe(channel, ws);
-          // FIX: Send channel in payload to match client expectations
           ws.send(JSON.stringify({ 
             type: 'subscribed', 
             payload: { channel },
-            channel  // Also keep at root for compatibility
+            channel
           }));
           break;
 
@@ -379,7 +353,6 @@ wss.on('connection', (ws, req) => {
             timestamp: payload.timestamp || new Date().toISOString()
           };
           
-          // FIX: Use unified channel creation
           const chatChannel = createUnifiedChannel('chat', payload.senderId, payload.receiverId);
           channelManager.broadcast(chatChannel, { type: 'newMessage', data: messageData });
           break;
@@ -390,7 +363,6 @@ wss.on('connection', (ws, req) => {
             return;
           }
           
-          // FIX: Use unified channel creation
           const typingChannel = createUnifiedChannel('chat', payload.senderId, payload.receiverId);
           channelManager.broadcast(typingChannel, { type: 'typing', data: payload }, ws);
           break;
@@ -401,32 +373,33 @@ wss.on('connection', (ws, req) => {
             return;
           }
           
-          // FIX: Use unified channel creation
           const seenChannel = createUnifiedChannel('chat', payload.senderId, payload.receiverId);
           channelManager.broadcast(seenChannel, {
             type: 'messageSeenAcknowledgment',
-            data: { id: payload.messageId, seenBy: payload.senderId, seenAt: new Date().toISOString() }
+            data: { 
+              id: payload.messageId, 
+              seenBy: payload.senderId, 
+              seenAt: new Date().toISOString() 
+            }
           });
           break;
 
-        // WebRTC with call notifications - USE CLIENT'S CHANNEL!
         case 'rtc-offer':
           if (!channel || !payload?.from || !payload?.to || !payload?.offer || !payload?.callType) {
             ws.send(JSON.stringify({ type: 'error', error: 'Invalid RTC offer' }));
             return;
           }
           
-          console.log(`📞 Offer on channel: ${channel}`);
-          
-          // Send push notification for incoming call
           sendCallNotification(payload.from, payload.to, payload.callType);
           
-          // FIX: Use the channel provided by client
           channelManager.broadcast(channel, {
             type: 'offer',
-            data: { ...payload.offer, from: payload.from, callType: payload.callType }
+            data: { 
+              ...payload.offer, 
+              from: payload.from, 
+              callType: payload.callType 
+            }
           });
-          console.log(`📞 ${payload.callType} call: ${payload.from} → ${payload.to}`);
           break;
 
         case 'rtc-answer':
@@ -435,14 +408,13 @@ wss.on('connection', (ws, req) => {
             return;
           }
           
-          console.log(`📞 Answer on channel: ${channel}`);
-          
-          // FIX: Use the channel provided by client
           channelManager.broadcast(channel, {
             type: 'answer',
-            data: { ...payload.answer, from: payload.from }
+            data: { 
+              ...payload.answer, 
+              from: payload.from 
+            }
           });
-          console.log(`📞 Call answered: ${payload.from} → ${payload.to}`);
           break;
 
         case 'rtc-ice-candidate':
@@ -451,8 +423,13 @@ wss.on('connection', (ws, req) => {
             return;
           }
           
-          // FIX: Use the channel provided by client
-          const iceMessage = { type: 'ice-candidate', data: { ...payload.candidate, from: payload.from } };
+          const iceMessage = { 
+            type: 'ice-candidate', 
+            data: { 
+              ...payload.candidate, 
+              from: payload.from 
+            } 
+          };
           channelManager.broadcast(channel, iceMessage);
           break;
 
@@ -462,10 +439,14 @@ wss.on('connection', (ws, req) => {
             return;
           }
           
-          // FIX: Use the channel provided by client
-          const endMessage = { type: 'call-ended', data: { from: payload.from, reason: payload.reason || 'ended' } };
+          const endMessage = { 
+            type: 'call-ended', 
+            data: { 
+              from: payload.from, 
+              reason: payload.reason || 'ended' 
+            } 
+          };
           channelManager.broadcast(channel, endMessage);
-          console.log(`📞 Call ended: ${payload.from}`);
           break;
 
         case 'rtc-call-rejected':
@@ -474,27 +455,55 @@ wss.on('connection', (ws, req) => {
             return;
           }
           
-          // FIX: Use the channel provided by client
-          const rejectMessage = { type: 'call-rejected', data: { from: payload.from } };
+          const rejectMessage = { 
+            type: 'call-rejected', 
+            data: { 
+              from: payload.from 
+            } 
+          };
           channelManager.broadcast(channel, rejectMessage);
-          console.log(`📞 Call rejected: ${payload.from}`);
+          break;
+
+        case 'rtc-missed-call':
+          if (!channel || !payload?.from || !payload?.to) {
+            ws.send(JSON.stringify({ type: 'error', error: 'Invalid missed call' }));
+            return;
+          }
+          
+          channelManager.broadcast(channel, {
+            type: 'missed-call',
+            data: { 
+              from: payload.from, 
+              to: payload.to,
+              callType: payload.callType,
+              timestamp: payload.timestamp || Date.now()
+            }
+          });
           break;
 
         case 'ping':
-          ws.send(JSON.stringify({ type: 'pong', timestamp: new Date().toISOString() }));
+          ws.send(JSON.stringify({ 
+            type: 'pong', 
+            timestamp: new Date().toISOString() 
+          }));
           break;
 
         default:
-          ws.send(JSON.stringify({ type: 'error', error: `Unknown type: ${type}` }));
+          ws.send(JSON.stringify({ 
+            type: 'error', 
+            error: `Unknown type: ${type}` 
+          }));
           break;
       }
     } catch (error) {
-      console.error('❌ Error processing message:', error);
-      ws.send(JSON.stringify({ type: 'error', error: 'Invalid message' }));
+      ws.send(JSON.stringify({ 
+        type: 'error', 
+        error: 'Invalid message' 
+      }));
     }
   });
 
-  ws.on('close', (code, reason) => {
+  ws.on('close', () => {
     clearTimeout(connectionTimeout);
     
     if (ws.clientId) {
@@ -518,8 +527,8 @@ wss.on('connection', (ws, req) => {
     }
   });
 
-  ws.on('error', (error) => {
-    console.error(`❌ WebSocket error for ${ws.clientId || 'unknown'}:`, error.message);
+  ws.on('error', () => {
+    // Silent fail
   });
 
   ws.send(JSON.stringify({
@@ -529,7 +538,6 @@ wss.on('connection', (ws, req) => {
   }));
 });
 
-// Cleanup dead connections
 setInterval(() => {
   const now = Date.now();
   
@@ -546,9 +554,8 @@ setInterval(() => {
       clientManager.removeClient(clientId);
     }
   });
-}, 300000);
+}, CLEANUP_INTERVAL);
 
-// Graceful shutdown
 const shutdown = () => {
   wss.clients.forEach(client => {
     client.send(JSON.stringify({ type: 'server-shutdown' }));
@@ -560,8 +567,6 @@ const shutdown = () => {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚀 WebSocket server running on port ${PORT}`);
-  console.log(`📡 Push API: ${PUSH_API_URL}`);
+  console.log(`WebSocket server running on port ${PORT}`);
 });
